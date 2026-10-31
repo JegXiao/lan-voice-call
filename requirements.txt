@@ -1,0 +1,3 @@
+# 仅 generate_cert.py（生成自签证书）需要；server.py 本身只用 Python 标准库
+# Only needed by generate_cert.py (self-signed cert); server.py itself uses the stdlib only
+cryptography>=41

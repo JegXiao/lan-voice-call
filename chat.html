@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Voice Always-On</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #1a2a6c, #b21f1f, #fdbb2d); color: white; margin: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
+        .status-panel { background: rgba(0,0,0,0.4); backdrop-filter: blur(20px); padding: 40px; border-radius: 50%; width: 250px; height: 250px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 2px solid rgba(255,255,255,0.2); box-shadow: 0 0 50px rgba(0,0,0,0.5); position: relative; }
+        #visualizer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 50%; z-index: -1; opacity: 0.5; }
+        .live-tag { background: #ff4757; padding: 5px 15px; border-radius: 20px; font-size: 0.8rem; font-weight: bold; animation: blink 1s infinite; margin-top: 10px; }
+        @keyframes blink { 50% { opacity: 0.5; } }
+        .online-count { font-size: 0.9rem; margin-top: 15px; opacity: 0.8; }
+        .tips { position: fixed; bottom: 20px; font-size: 0.8rem; opacity: 0.6; text-align: center; }
+    </style>
+</head>
+<body>
+
+<div class="status-panel">
+    <canvas id="visualizer"></canvas>
+    <div style="font-size: 1.2rem; font-weight: bold;">实时通话中</div>
+    <div id="statusText" style="font-size: 0.8rem; margin-top: 5px;">等待同步...</div>
+    <div class="live-tag">LIVE</div>
+    <div class="online-count" id="onlineCount">在线人数: 1</div>
+</div>
+
+<div class="tips">进入页面即自动连接<br>如无声音，请点击屏幕任意位置触发权限</div>
+
+<audio id="remoteAudio" autoplay></audio>
+
+<script>
+    // 随机生成一个短 ID
+    const myId = "UID_" + Math.random().toString(36).substr(2, 4);
+    let localStream, audioCtx, analyser, dataArray;
+
+    // 存储与每个远程用户的 PeerConnection
+    // 格式: { "UID_xxxx": RTCPeerConnection }
+    const peerConnections = {};
+
+    async function init() {
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            document.getElementById('statusText').innerText = "ID: " + myId;
+
+            setupVisualizer(localStream);
+
+            // 启动定时任务：心跳、信令、在线列表
+            setInterval(heartbeatAndSignaling, 2000);
+            setInterval(autoConnect, 3000);
+
+        } catch (e) {
+            document.getElementById('statusText').innerText = "获取麦克风失败";
+            console.error(e);
+        }
+    }
+
+    // 1. 心跳并拉取信令
+    async function heartbeatAndSignaling() {
+        const res = await fetch('/api/heartbeat', { method: 'POST', body: JSON.stringify({ id: myId }) });
+        const signals = await res.json();
+
+        signals.forEach(async s => {
+            let pc = peerConnections[s.from];
+
+            if (s.type === 'offer') {
+                console.log("收到 Offer 来自:", s.from);
+                pc = createPeer(s.from);
+                await pc.setRemoteDescription(new RTCSessionDescription(s.data));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                sendSignal(s.from, 'answer', answer);
+            } else if (s.type === 'answer' && pc) {
+                console.log("收到 Answer 来自:", s.from);
+                await pc.setRemoteDescription(new RTCSessionDescription(s.data));
+            } else if (s.type === 'candidate' && pc) {
+                try { await pc.addIceCandidate(new RTCIceCandidate(s.data)); } catch(e){}
+            }
+        });
+    }
+
+    // 2. 自动连接逻辑：发现新用户则自动呼叫
+    async function autoConnect() {
+        const res = await fetch('/api/online');
+        const list = await res.json();
+        document.getElementById('onlineCount').innerText = "在线人数: " + list.length;
+
+        list.forEach(async dev => {
+            if (dev.id === myId) return;
+
+            // 自动对碰策略：如果我没和对方连接，且我的 ID 小于对方，我负责发起 Offer
+            // 这样能保证两台机器之间只有一条连接，不会连两次
+            if (!peerConnections[dev.id] && myId < dev.id) {
+                console.log("自动发起呼叫 ->", dev.id);
+                const pc = createPeer(dev.id);
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                sendSignal(dev.id, 'offer', offer);
+            }
+        });
+    }
+
+    function createPeer(targetId) {
+        if (peerConnections[targetId]) return peerConnections[targetId];
+
+        const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+
+        // 添加本地音轨
+        localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+        // 收到远程音轨
+        pc.ontrack = e => {
+            console.log("收到远程音轨:", targetId);
+            // 注意：为了支持多路通话，实际应该动态创建多个 audio 标签
+            // 这里为了演示，简单地复用一个
+            document.getElementById('remoteAudio').srcObject = e.streams[0];
+        };
+
+        pc.onicecandidate = e => {
+            if (e.candidate) sendSignal(targetId, 'candidate', e.candidate);
+        };
+
+        // 存入管理器
+        peerConnections[targetId] = pc;
+        return pc;
+    }
+
+    async function sendSignal(to, type, data) {
+        await fetch('/api/push', { method: 'POST', body: JSON.stringify({ to, from: myId, type, data }) });
+    }
+
+    // --- 音波视觉效果 ---
+    function setupVisualizer(stream) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = audioCtx.createAnalyser();
+        audioCtx.createMediaStreamSource(stream).connect(analyser);
+        analyser.fftSize = 64;
+        dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+        const canvas = document.getElementById('visualizer');
+        const ctx = canvas.getContext('2d');
+        function draw() {
+            requestAnimationFrame(draw);
+            analyser.getByteFrequencyData(dataArray);
+            ctx.clearRect(0,0,canvas.width, canvas.height);
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            dataArray.forEach((v, i) => {
+                const r = 100 + (v/255)*50;
+                const angle = (i / dataArray.length) * Math.PI * 2;
+                const x = 150 + r * Math.cos(angle);
+                const y = 75 + r * Math.sin(angle);
+                if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+            });
+            ctx.closePath();
+            ctx.stroke();
+        }
+        draw();
+    }
+
+    // 解决浏览器自动播放限制：点击页面任何地方激活音频上下文
+    window.onclick = () => { if(audioCtx) audioCtx.resume(); };
+
+    init();
+</script>
+</body>
+</html>
